@@ -1,10 +1,13 @@
 extends Node2D
 
+## UI
 @onready var time_label: Label = $UI/Control/TimeLabel
+@onready var restart_button: Button = $UI/Control/RestartButton
+@onready var draw_portal_line: DrawPortalLine = $DrawPortalLine
 
 @onready var under: TileMapLayer = $Under
 @onready var spawner_component: SpawnerComponent = $SpawnerComponent
-@onready var hero: Sprite2D = $Hero
+@onready var hero: Node2D = $Hero
 @onready var cover: TileMapLayer = $Cover
 @onready var dragable_camera: DragableCamera = $DragableCamera
 
@@ -12,12 +15,18 @@ extends Node2D
 const MAP_WIDTH = 80
 const MAP_HEIGHT = 45
 
+@export var rule_1: bool = true ## 0-3数字规则，将去除传送门和怪，即0-1
+@export var rule_2: bool = true ## 计算规则，将不进行四个的计算
+
 @export var initial_time: float = 60.0
 # 导出变量，方便你在编辑器属性面板里调整
 @export_group("Map Generation")
 @export var monster_count: int = 180        # 怪兽(2)的数量
 @export var portal_pairs: int = 36          # 传送门(3)的对数 (5对=10个)
-@export_range(0.0, 1.0) var openness: float = 0.3 # 开阔度：0为单一直路，1为全地图铺满路。推荐0.1-0.2
+
+@export_range(0, 10, 1) var waypoints: int = 5 ## 途径点
+@export_range(0.0, 1.0) var random_trace: float = 0.6 ## 游走趋势，越大越向着终点游走，越小越随机
+@export_range(0.0, 1.0) var openness: float = 0.5 ## 开阔度：0为单一直路，1为全地图铺满路
 
 # ---------------------- 运行时变量 ----------------------
 var current_time: float = 0.0
@@ -31,9 +40,19 @@ var end_pos: Vector2i
 var level_data: Array = [] 
 var portal_locations: Array[Vector2i] = []
 
+func _on_restart_pressed() -> void:
+	await get_tree().create_timer(0.5).timeout
+	get_tree().reload_current_scene()
 
 func _ready() -> void:
+	restart_button.pressed.connect(_on_restart_pressed)
+	restart_button.hide()
+	
 	set_process_unhandled_input(false)
+	
+	# 同步gamedata
+	rule_1 = GameData.enable_rule_1
+	rule_2 = GameData.enable_rule_2
 	# 1. 初始化地图数据
 	_init_level_data()
 	
@@ -47,18 +66,22 @@ func _ready() -> void:
 	# 初始朝向动画（默认向下或根据需求）
 	hero.play_anime("idle") 
 	
-	# 4. 生成数字 Label (使用你的 Spawner 接口)
-	_generate_number_labels()
+	cover.clear()
+	if not rule_1 and not rule_2:
+		_generate_map_wall()
+	else:
+		_generate_number_labels()
 	
 	# 标出起点和终点
-	cover.clear()
+	
 	cover.set_cell(start_pos, 0, Vector2i(3, 0))
 	cover.set_cell(end_pos, 0, Vector2i(2, 0))
-	await get_tree().create_timer(3).timeout
+	await get_tree().create_timer(2.5).timeout
 	await tween_camera(cover.map_to_local(end_pos), Vector2i(4, 4))
-	await get_tree().create_timer(1).timeout
+	await get_tree().create_timer(0.8).timeout
 	await tween_camera(cover.map_to_local(start_pos), Vector2i(4, 4))
 	# 允许操作
+	draw_portal_line.walk_path.append(under.map_to_local(start_pos))
 	set_process_unhandled_input(true)
 
 func _process(delta: float) -> void:
@@ -72,6 +95,10 @@ func _process(delta: float) -> void:
 		_game_over(false)
 
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey:
+		if event.pressed and event.keycode == KEY_SHIFT:
+			draw_portal_line.visible = !draw_portal_line.visible
+	
 	if not game_active:
 		return
 		
@@ -85,12 +112,15 @@ func _unhandled_input(event: InputEvent) -> void:
 		move_dir = Vector2i.LEFT
 	elif event.is_action_pressed("ui_right"):
 		move_dir = Vector2i.RIGHT
-		
+	# 脱出传送门
+	elif event.is_action_pressed("ui_accept"):
+		if _calculate_neighbor_sum(player_grid_pos.x, player_grid_pos.y) == 0:
+			_try_move(Vector2i.ZERO)
+	
 	if move_dir != Vector2i.ZERO:
 		_try_move(move_dir)
 
 # ---------------------- 核心移动逻辑 ----------------------
-
 func _try_move(direction: Vector2i) -> void:
 	var target_pos = player_grid_pos + direction
 	
@@ -101,26 +131,21 @@ func _try_move(direction: Vector2i) -> void:
 		
 	var cell_type = level_data[target_pos.y][target_pos.x]
 	
-	# --- 修改开始 ---
-	# 原来的规则：if cell_type == 0: return
-	# 现在的逻辑：0是墙，绝对不能走。
-	# 但如果 cell_type 是 3 (传送门)，它虽然曾是墙，但现在是特殊的门，应该允许进入。
-	
 	if cell_type == 0: 
 		return # 只有0才是绝对的墙
-	# --- 修改结束 ---
 	
 	player_grid_pos = target_pos
+	draw_portal_line.walk_path.append(under.map_to_local(target_pos))
+	draw_portal_line.queue_redraw()
 	_update_hero_position(player_grid_pos)
 	
 	_handle_cell_event(cell_type, target_pos)
 	
-	# 注意：这里的胜利判断需要用新的 end_pos 变量，而不是之前的常量
+	tween_camera(cover.map_to_local(player_grid_pos), Vector2i(4, 4))
+	
 	if player_grid_pos == end_pos:
 		_game_over(true)
 	
-	tween_camera(cover.map_to_local(player_grid_pos), Vector2i(4, 4))
-
 func _play_hero_animation(dir: Vector2i):
 	if dir == Vector2i.UP:
 		hero.play_anime("move_up")
@@ -135,12 +160,15 @@ func _handle_cell_event(type: int, pos: Vector2i) -> void:
 	match type:
 		2: # 怪兽
 			print("遭遇怪兽！时间 -2s")
+			hero.play_anime("hurt")
 			current_time -= 2.0
 		3: # 传送门
 			_teleport_player(pos)
 
 func _teleport_player(current_portal_pos: Vector2i) -> void:
 	# 简单的传送逻辑：传送到列表中的下一个传送门
+	if draw_portal_line.portal_line.is_empty():
+		draw_portal_line.portal_line.append(under.map_to_local(current_portal_pos))
 	for i in range(portal_locations.size()):
 		if portal_locations[i] == current_portal_pos:
 			# 找到下一个传送门索引（循环）
@@ -150,10 +178,12 @@ func _teleport_player(current_portal_pos: Vector2i) -> void:
 			# 如果只有一个传送门，不传送
 			if target_portal == current_portal_pos:
 				return
-				
+			
+			draw_portal_line.portal_line.append(under.map_to_local(target_portal))
+			draw_portal_line.queue_redraw()
 			player_grid_pos = target_portal
 			_update_hero_position(player_grid_pos)
-			print("传送至: ", target_portal)
+			hero.play_anime("idle")
 			break
 
 func _update_hero_position(grid_pos: Vector2i) -> void:
@@ -165,11 +195,16 @@ func _game_over(is_win: bool) -> void:
 	if is_win:
 		print("游戏胜利！")
 		time_label.text = "WIN!"
-		time_label.modulate = Color.GREEN
+		time_label.modulate = Color.GOLD
 	else:
 		print("游戏失败！")
 		time_label.text = "LOSE"
 		time_label.modulate = Color.RED
+	time_label.set_anchors_preset(Control.PRESET_CENTER, true)
+	time_label.scale = Vector2(3, 3)
+	tween_camera(Vector2(640, 360), Vector2(1, 1))
+	restart_button.show()
+	
 
 # ---------------------- 数据与生成 ----------------------
 func _init_level_data() -> void:
@@ -193,7 +228,17 @@ func _init_level_data() -> void:
 	player_grid_pos = start_pos
 	
 	# 3. 生成主路径 (保证连通性)
-	_carve_path(start_pos, end_pos)
+	var way_pass: Array[Vector2i] = []
+	way_pass.resize(waypoints)
+	for i in range(waypoints):
+		way_pass[i] = Vector2i(randi() % MAP_WIDTH, randi() % MAP_HEIGHT)
+	_carve_path(start_pos, way_pass[0])
+	_carve_path(way_pass[-1], end_pos)
+	for i in range(way_pass.size() - 1):
+		_carve_path(way_pass[i], way_pass[i+1])
+	_carve_path(start_pos, way_pass.pick_random())
+	_carve_path(end_pos, way_pass.pick_random())
+	
 	
 	# 4. 增加随机噪点 (让地图更像迷宫，而不是一条线)
 	_add_random_noise()
@@ -203,7 +248,8 @@ func _init_level_data() -> void:
 	level_data[end_pos.y][end_pos.x] = 1
 	
 	# 5. 放置怪兽 (2) 和 传送门 (3)
-	_place_monsters_and_portals()
+	if rule_1:
+		_place_monsters_and_portals()
 	
 	# 6. 更新 Hero 位置
 	_update_hero_position(start_pos)
@@ -224,7 +270,7 @@ func _carve_path(from: Vector2i, to: Vector2i) -> void:
 		
 		# 简单的随机游走算法：
 		# 60% 的概率向终点方向靠拢，40% 的概率随机移动
-		if randf() < 0.6:
+		if randf() < random_trace:
 			# 向终点靠拢
 			var diff = to - current
 			# 优先消除距离大的轴
@@ -256,6 +302,12 @@ func _add_random_noise() -> void:
 			if level_data[y][x] == 0:
 				if randf() < openness:
 					level_data[y][x] = 1
+	for y in range(MAP_HEIGHT):
+		for x in range(MAP_WIDTH):
+			# 如果是路，满足八格的条件下有概率变成墙
+			if level_data[y][x] == 1:
+				if randf() < (1-openness) and _calculate_eight_neighbor(x, y):
+					level_data[y][x] = 0
 
 func _place_monsters_and_portals() -> void:
 	# --- 放置怪兽 (2) ---
@@ -314,17 +366,21 @@ func _generate_number_labels() -> void:
 	for y in range(MAP_HEIGHT):
 		for x in range(MAP_WIDTH):
 			# 1. 计算周围四格数值和
-			var sum_val = _calculate_neighbor_sum(x, y)
-			
-			# 2. 计算生成的世界坐标
-			# map_to_local 得到的是相对于 TileMap 的坐标
-			# 如果 TileMap 不在 (0,0)，需要 to_global 转换，这里假设父节点就是 Main
-			var local_pos = under.map_to_local(Vector2i(x, y))
-			var global_pos = under.to_global(local_pos)
-			
-			# 3. 调用你的 Spawner 接口
-			# 对应：spawn(global_spawn_position: Vector2, flag: int)
-			spawner_component.spawn(global_pos, sum_val)
+			if rule_2:
+				var sum_val = _calculate_neighbor_sum(x, y)
+				var local_pos = under.map_to_local(Vector2i(x, y))
+				var global_pos = under.to_global(local_pos)
+				spawner_component.spawn(global_pos, sum_val)
+			else:
+				var local_pos = under.map_to_local(Vector2i(x, y))
+				var global_pos = under.to_global(local_pos)
+				spawner_component.spawn(global_pos, level_data[y][x])
+
+func _generate_map_wall() -> void:
+	for y in range(MAP_HEIGHT):
+		for x in range(MAP_WIDTH):
+			if level_data[y][x] == 0:
+				under.set_cell(Vector2i(x, y), 0, Vector2i.ZERO)
 
 func _calculate_neighbor_sum(x: int, y: int) -> int:
 	var directions = [Vector2i.UP, Vector2i.DOWN, Vector2i.LEFT, Vector2i.RIGHT]
@@ -336,6 +392,18 @@ func _calculate_neighbor_sum(x: int, y: int) -> int:
 			total += level_data[check_pos.y][check_pos.x]
 			
 	return total
+
+# 周围8格都是路时，返回真
+func _calculate_eight_neighbor(x: int, y: int) -> bool:
+	var directions = [Vector2i.UP, Vector2i.DOWN, Vector2i.LEFT, Vector2i.RIGHT,
+		Vector2i(1, 1), Vector2i(-1, -1), Vector2i(-1, 1), Vector2i(-1, 1)]
+	for dir in directions:
+		var check_pos = Vector2i(x, y) + dir
+		if _is_inside_grid(check_pos):
+			if level_data[check_pos.y][check_pos.x] == 0:
+				return false
+			
+	return true
 
 func _is_inside_grid(pos: Vector2i) -> bool:
 	return pos.x >= 0 and pos.x < MAP_WIDTH and pos.y >= 0 and pos.y < MAP_HEIGHT
